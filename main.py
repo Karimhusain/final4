@@ -271,5 +271,12 @@ def send_combined_analysis(all_analysis_data):
     send_to_discord(embed=embed)
 
 
-# --- Main Execution Loop ---
+# ... (code above)
+
+# Line 275:
 if __name__ == "__main__":
+    # THIS LINE (and all subsequent lines within this block) MUST BE INDENTED BY 4 SPACES
+    logging.info("Starting crypto analysis bot for 1h, 4h, 1d. Combined updates sent to Discord when new candles close.")
+    # ... and so on for all lines until the very end of the script
+    last_processed_candle_time = {tf: None for tf in timeframes.keys()}
+    # ... all the way down to the final "No new candles closed..." logging line.
