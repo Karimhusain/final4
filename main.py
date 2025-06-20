@@ -23,21 +23,21 @@ exchange = ccxt.binance({
 symbol = 'BTC/USDT'
 timeframes = {
     '1h': {
-        'limit': 300, # Ditingkatkan dari 150
+        'limit': 300, 
         'ema1': 10, 'ema2': 20,
         'rsi': 14,
         'stoch_k': 5, 'stoch_d': 3,
         'ichimoku_fast': 9, 'ichimoku_medium': 26, 'ichimoku_slow': 52
     },
     '4h': {
-        'limit': 500, # Ditingkatkan dari 200
+        'limit': 500, 
         'ema1': 21, 'ema2': 50,
         'rsi': 14,
         'stoch_k': 5, 'stoch_d': 3,
         'ichimoku_fast': 9, 'ichimoku_medium': 26, 'ichimoku_slow': 52
     },
     '1d': {
-        'limit': 700, # Ditingkatkan dari 300
+        'limit': 700, 
         'ema1': 50, 'ema2': 100,
         'rsi': 14,
         'stoch_k': 14, 'stoch_d': 3,
@@ -57,7 +57,6 @@ def analyze_tf(tf, settings):
     """
     logging.info(f"Starting analysis for {symbol} on {tf.upper()} timeframe.")
     try:
-        # Fetching OHLCV data
         ohlcv = exchange.fetch_ohlcv(symbol, tf, limit=settings['limit'])
         if not ohlcv:
             logging.warning(f"[{tf}] No OHLCV data fetched for {symbol}. Skipping analysis.")
@@ -66,20 +65,13 @@ def analyze_tf(tf, settings):
         df = pd.DataFrame(ohlcv, columns=['time', 'open', 'high', 'low', 'close', 'volume'])
         df['time'] = pd.to_datetime(df['time'], unit='ms')
 
-        # Check for sufficient data points BEFORE calculating indicators
-        # Ichimoku_slow (52) + 26 (Future shift) for Senkou A/B might need up to 78 candles for a non-NaN value
-        # It's good to fetch more than enough.
-        # A simple check for the longest period (ichimoku_slow = 52) plus some buffer (e.g., 26 for future shift)
-        # So about 52 + 26 = 78 needed for Ichimoku to potentially be non-NaN at the end.
-        # The 'limit' in settings should handle this.
-        # This required_data_points check is fine, but increasing 'limit' is the primary fix.
-        required_data_points_for_ichimoku = settings['ichimoku_slow'] + 26 # Adding the future shift period
-        if len(df) < required_data_points_for_ichimoku:
-            logging.warning(f"[{tf}] Not enough data ({len(df)} points) for Ichimoku Cloud. Minimum needed (approx): {required_data_points_for_ichimoku}. Ichimoku will likely be NaN.")
-            # We don't return None here, we let it proceed so other indicators can still be calculated,
-            # but Ichimoku will correctly be NaN.
+        required_data_points_for_ichimoku = settings['ichimoku_slow'] + 26 # Minimum needed for non-NaN senkou A/B at *current* index
 
-        # Calculate indicators
+        if len(df) < required_data_points_for_ichimoku:
+            logging.warning(f"[{tf}] Not enough data ({len(df)} points) for full Ichimoku Cloud calculation (Senkou A/B will be NaN). Minimum needed (approx): {required_data_points_for_ichimoku}.")
+            # Lanjutkan eksekusi agar indikator lain tetap bisa dihitung
+            # Ichimoku_senkou_a dan _b akan tetap NaN di bagian terakhir jika tidak cukup data
+
         df['ema1'] = ta.ema(df['close'], length=settings['ema1'])
         df['ema2'] = ta.ema(df['close'], length=settings['ema2'])
 
@@ -97,23 +89,34 @@ def analyze_tf(tf, settings):
             df['stoch_d'] = stoch.iloc[:, 1] if stoch.shape[1] > 1 else float('nan')
             logging.warning(f"[{tf}] Stochastic columns not found by specific names, using default first/second columns.")
 
-        ichi = ta.ichimoku(df['high'], df['low'], df['close'])
+        ichi = ta.ichimoku(df['high'], df['low'], df['close'], append=True) # Tambahkan append=True agar langsung masuk ke DataFrame
+        
+        # --- PERBAIKAN UNTUK ICHIMOKU CLOUD DIMULAI DI SINI ---
+        # Setelah append=True, kolom Ichimoku harusnya ada di df
+        # Akses Senkou A dan B dari kolom yang sudah ditambahkan oleh pandas_ta
+        # Kita perlu mengambil nilai Senkou A dan B *sebelum* 26 periode terakhir
+        # karena mereka diproyeksikan ke depan.
 
-        df['senkou_a'] = float('nan')
-        df['senkou_b'] = float('nan')
+        current_senkou_a = float('nan')
+        current_senkou_b = float('nan')
 
-        if isinstance(ichi, tuple) and len(ichi) >= 5:
-            df['senkou_a'] = ichi[2]
-            df['senkou_b'] = ichi[3]
-        elif isinstance(ichi, pd.DataFrame):
-            df['senkou_a'] = ichi['ISA_9'] if 'ISA_9' in ichi.columns else float('nan')
-            df['senkou_b'] = ichi['ISB_26'] if 'ISB_26' in ichi.columns else float('nan')
+        # Cek apakah kolom-kolom Ichimoku ada di DataFrame
+        if f'ISA_{settings["ichimoku_fast"]}' in df.columns and f'ISB_{settings["ichimoku_medium"]}' in df.columns:
+            # Senkou A (ISA) diproyeksikan 26 periode ke depan.
+            # Jadi, nilai ISA untuk 'sekarang' ada di indeks df.index[-1-26]
+            # Pastikan indeks tidak out of bounds
+            if len(df) > 26:
+                current_senkou_a = df[f'ISA_{settings["ichimoku_fast"]}'].iloc[-1 - 26] # Ambil nilai 26 candle ke belakang
+                current_senkou_b = df[f'ISB_{settings["ichimoku_medium"]}'].iloc[-1 - 26] # Ambil nilai 26 candle ke belakang
+            else:
+                 logging.warning(f"[{tf}] Not enough data to calculate historical Senkou A/B for current candle. Expected {settings['ichimoku_slow']}+26, got {len(df)}.")
         else:
-            logging.critical(f"[{tf}] Unexpected type for Ichimoku output: {type(ichi)}. Ichimoku Spans will be NaN.")
+            logging.warning(f"[{tf}] Ichimoku Cloud columns (ISA/ISB) not found in DataFrame after calculation. They will be NaN.")
+
+        # --- PERBAIKAN UNTUK ICHIMOKU CLOUD SELESAI DI SINI ---
         
-        last = df.iloc[-1]
+        last = df.iloc[-1] # Ambil data candle terakhir
         
-        # --- Price Action Analysis ---
         price_action_info = ""
         if last['close'] > last['open']:
             candle_type = "Bullish Candle 🟢"
@@ -139,13 +142,12 @@ def analyze_tf(tf, settings):
             candle_type = "Doji/Neutral Candle ⚪"
             price_action_info = "Indecision in the market."
 
-        # Logic Signal
         trend = 'SIDEWAYS'
-        # Only evaluate trend if Senkou Spans are not NaN
-        if pd.notna(last['senkou_a']) and pd.notna(last['senkou_b']):
-            if last['close'] > last['senkou_a'] and last['close'] > last['senkou_b']:
+        # Gunakan current_senkou_a/b untuk penentuan tren Ichimoku
+        if pd.notna(current_senkou_a) and pd.notna(current_senkou_b):
+            if last['close'] > current_senkou_a and last['close'] > current_senkou_b:
                 trend = 'BULLISH'
-            elif last['close'] < last['senkou_a'] and last['close'] < last['senkou_b']:
+            elif last['close'] < current_senkou_a and last['close'] < current_senkou_b:
                 trend = 'BEARISH'
 
         ema_cross = 'Death Cross (Bearish)'
@@ -155,10 +157,9 @@ def analyze_tf(tf, settings):
 
         stoch_trend = 'Bearish Cross'
         if pd.notna(last['stoch_k']) and pd.notna(last['stoch_d']):
-            if pd.notna(last['stoch_k']) and pd.notna(last['stoch_d']) and last['stoch_k'] > last['stoch_d']: # Add NaN check for stoch
+            if last['stoch_k'] > last['stoch_d']:
                 stoch_trend = 'Bullish Cross'
         
-        # Sekarang fungsi ini hanya mengembalikan data, tidak mengirim ke Discord
         analysis_data = {
             'tf': tf.upper(),
             'close_price': last['close'],
@@ -170,8 +171,8 @@ def analyze_tf(tf, settings):
             'stoch_k': last['stoch_k'],
             'stoch_d': last['stoch_d'],
             'stoch_trend': stoch_trend,
-            'senkou_a': last['senkou_a'], # Tambahkan ini
-            'senkou_b': last['senkou_b']  # Tambahkan ini
+            'senkou_a': current_senkou_a, # Gunakan nilai yang sudah diperbaiki
+            'senkou_b': current_senkou_b  # Gunakan nilai yang sudah diperbaiki
         }
         
         console_message = f"\n=== [{tf.upper()}] BTC/USDT ===\n" \
@@ -181,7 +182,7 @@ def analyze_tf(tf, settings):
                           f"EMA {settings['ema1']}/{settings['ema2']}: {ema_cross}\n" \
                           f"RSI: {last['rsi']:.2f}\n" \
                           f"Stochastic K: {last['stoch_k']:.2f}, D: {last['stoch_d']:.2f} ({stoch_trend})\n" \
-                          f"Ichimoku Cloud: ISA:{last['senkou_a']:.2f}, ISB:{last['senkou_b']:.2f}\n" \
+                          f"Ichimoku Cloud: ISA:{current_senkou_a:.2f}, ISB:{current_senkou_b:.2f}\n" \
                           f"===============================\n"
         logging.info(console_message)
 
@@ -247,14 +248,13 @@ def send_combined_analysis(all_analysis_data):
         elif tf_data['trend'] == 'SIDEWAYS':
             has_sideways = True
         
-        # Tambahkan field untuk setiap timeframe dengan detail lengkap termasuk Price Action dan Ichimoku Cloud
         field_value = (
             f"**Harga:** `{tf_data['close_price']:.2f}` USDT\n"
             f"**Candle:** {tf_data['candle_type']} ({tf_data['price_action']})\n"
             f"**Trend (Ichimoku):** **{tf_data['trend']}**\n"
             f"**EMA:** {tf_data['ema_cross']}\n"
             f"**RSI:** `{tf_data['rsi']:.2f}` | **Stoch:** K:`{tf_data['stoch_k']:.2f}` D:`{tf_data['stoch_d']:.2f}` ({tf_data['stoch_trend']})\n"
-            f"**Ichimoku Cloud:** ISA:`{tf_data['senkou_a']:.2f}` | ISB:`{tf_data['senkou_b']:.2f}`" # Senkou A & B di sini
+            f"**Ichimoku Cloud:** ISA:`{tf_data['senkou_a']:.2f}` | ISB:`{tf_data['senkou_b']:.2f}`"
         )
         embed_fields.append({
             "name": f"📊 {symbol} - {tf_data['tf']}",
