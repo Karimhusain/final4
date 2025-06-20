@@ -85,41 +85,29 @@ def analyze_tf(tf, settings):
         # --- PERBAIKAN UNTUK ICHIMOKU CLOUD DIMULAI DI SINI ---
         ichi = ta.ichimoku(df['high'], df['low'], df['close'])
 
-        ichi_df = None
-        if isinstance(ichi, tuple):
-            # If it's a tuple of Series, concatenate them into a DataFrame
-            ichi_df = pd.concat(ichi, axis=1)
+        # Initialize these columns to NaN first to prevent KeyError if Ichimoku fails
+        df['senkou_a'] = float('nan')
+        df['senkou_b'] = float('nan')
+
+        if isinstance(ichi, tuple) and len(ichi) >= 5: # Expecting 5 Series in the tuple
+            # Assuming the standard order: Tenkan, Kijun, Senkou A, Senkou B, Chikou Span
+            df['senkou_a'] = ichi[2] # Senkou A (ISA_9) is typically the 3rd Series (index 2)
+            df['senkou_b'] = ichi[3] # Senkou B (ISB_26) is typically the 4th Series (index 3)
+            # You might also want to store other Ichimoku lines for future use:
+            # df['tenkan_sen'] = ichi[0]
+            # df['kijun_sen'] = ichi[1]
+            # df['chikou_span'] = ichi[4]
         elif isinstance(ichi, pd.DataFrame):
-            ichi_df = ichi # Already a DataFrame
+            # If pandas_ta returns a DataFrame, access by precise column names
+            df['senkou_a'] = ichi['ISA_9'] if 'ISA_9' in ichi.columns else float('nan')
+            df['senkou_b'] = ichi['ISB_26'] if 'ISB_26' in ichi.columns else float('nan')
+            # Also store other Ichimoku lines if they exist and are needed
+            # df['tenkan_sen'] = ichi['ITS_9'] if 'ITS_9' in ichi.columns else float('nan')
+            # df['kijun_sen'] = ichi['IKS_26'] if 'IKS_26' in ichi.columns else float('nan')
+            # df['chikou_span'] = ichi['ICS_26'] if 'ICS_26' in ichi.columns else float('nan')
         else:
-            logging.critical(f"[{tf}] Unexpected type for Ichimoku output: {type(ichi)}. Cannot parse. Setting Ichimoku to NaN.")
-            df['senkou_a'] = float('nan')
-            df['senkou_b'] = float('nan')
-            last = df.iloc[-1] # Ensure 'last' is defined even if Ichimoku fails
-            send_to_discord(message=f"Error Ichimoku {tf.upper()}: Unexpected output type. Check logs.")
-            return None # Skip further analysis for this TF
-
-        # Try to find the columns by their expected names or common patterns
-        senkou_a_col = next((col for col in ichi_df.columns if 'ISA' in col and '9' in col), None) # Check for ISA and 9 (fast period)
-        senkou_b_col = next((col for col in ichi_df.columns if 'ISB' in col and '26' in col), None) # Check for ISB and 26 (medium period)
-
-        if senkou_a_col and senkou_b_col:
-            df['senkou_a'] = ichi_df[senkou_a_col]
-            df['senkou_b'] = ichi_df[senkou_b_col]
-        else:
-            logging.error(f"[{tf}] Could not find Senkou Span A or B columns in Ichimoku output by name. Available columns: {ichi_df.columns.tolist()}")
-            # Fallback to numerical indexing if names not found (less reliable but might work)
-            if ichi_df.shape[1] >= 2: # Ensure there are at least two columns for A and B
-                # The last two columns are typically Senkou A and Senkou B, but order might vary
-                # It's better to explicitly check names or rely on consistent indexing if names are not present
-                # As a last resort, assume standard order: ISA is typically before ISB in the tuple/DataFrame
-                df['senkou_a'] = ichi_df.iloc[:, -2] if ichi_df.shape[1] > 1 else float('nan')
-                df['senkou_b'] = ichi_df.iloc[:, -1] if ichi_df.shape[1] > 0 else float('nan') # This assumes Senkou B is the very last series
-                logging.warning(f"[{tf}] Using numerical indexing for Senkou Spans as names not found. Please verify correctness by checking pandas_ta Ichimoku output structure.")
-            else:
-                df['senkou_a'] = float('nan')
-                df['senkou_b'] = float('nan')
-                logging.warning(f"[{tf}] Not enough columns in Ichimoku output for Senkou Spans. Setting to NaN.")
+            logging.critical(f"[{tf}] Unexpected type for Ichimoku output: {type(ichi)}. Ichimoku Spans will be NaN.")
+            # If it fails to get Ichimoku, the columns are already NaN from initialization
         # --- PERBAIKAN UNTUK ICHIMOKU CLOUD SELESAI DI SINI ---
         
         # Ambil data terakhir
@@ -153,6 +141,7 @@ def analyze_tf(tf, settings):
 
         # Logic Signal
         trend = 'SIDEWAYS'
+        # Only evaluate trend if Senkou Spans are not NaN
         if pd.notna(last['senkou_a']) and pd.notna(last['senkou_b']):
             if last['close'] > last['senkou_a'] and last['close'] > last['senkou_b']:
                 trend = 'BULLISH'
