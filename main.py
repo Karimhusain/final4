@@ -65,12 +65,11 @@ def analyze_tf(tf, settings):
         df = pd.DataFrame(ohlcv, columns=['time', 'open', 'high', 'low', 'close', 'volume'])
         df['time'] = pd.to_datetime(df['time'], unit='ms')
 
-        required_data_points_for_ichimoku = settings['ichimoku_slow'] + 26 # Minimum needed for non-NaN senkou A/B at *current* index
+        required_data_points_for_ichimoku = settings['ichimoku_slow'] + 26 
 
         if len(df) < required_data_points_for_ichimoku:
-            logging.warning(f"[{tf}] Not enough data ({len(df)} points) for full Ichimoku Cloud calculation (Senkou A/B will be NaN). Minimum needed (approx): {required_data_points_for_ichimoku}.")
+            logging.warning(f"[{tf}] Not enough data ({len(df)} points) for full Ichimoku Cloud calculation (Senkou A/B will likely be NaN). Minimum needed (approx): {required_data_points_for_ichimoku}.")
             # Lanjutkan eksekusi agar indikator lain tetap bisa dihitung
-            # Ichimoku_senkou_a dan _b akan tetap NaN di bagian terakhir jika tidak cukup data
 
         df['ema1'] = ta.ema(df['close'], length=settings['ema1'])
         df['ema2'] = ta.ema(df['close'], length=settings['ema2'])
@@ -89,33 +88,38 @@ def analyze_tf(tf, settings):
             df['stoch_d'] = stoch.iloc[:, 1] if stoch.shape[1] > 1 else float('nan')
             logging.warning(f"[{tf}] Stochastic columns not found by specific names, using default first/second columns.")
 
-        ichi = ta.ichimoku(df['high'], df['low'], df['close'], append=True) # Tambahkan append=True agar langsung masuk ke DataFrame
+        # --- PERBAIKAN DAN DEBUGGING ICHIMOKU DIMULAI DI SINI ---
+        # Gunakan 'append=True' agar kolom Ichimoku ditambahkan langsung ke df
+        ta.ichimoku(df['high'], df['low'], df['close'], append=True) 
         
-        # --- PERBAIKAN UNTUK ICHIMOKU CLOUD DIMULAI DI SINI ---
-        # Setelah append=True, kolom Ichimoku harusnya ada di df
-        # Akses Senkou A dan B dari kolom yang sudah ditambahkan oleh pandas_ta
-        # Kita perlu mengambil nilai Senkou A dan B *sebelum* 26 periode terakhir
-        # karena mereka diproyeksikan ke depan.
+        # --- DEBUGGING: Cetak semua kolom DataFrame setelah Ichimoku dihitung ---
+        logging.debug(f"[{tf}] DataFrame columns after Ichimoku calculation: {df.columns.tolist()}")
+        # --- END DEBUGGING ---
 
         current_senkou_a = float('nan')
         current_senkou_b = float('nan')
 
-        # Cek apakah kolom-kolom Ichimoku ada di DataFrame
-        if f'ISA_{settings["ichimoku_fast"]}' in df.columns and f'ISB_{settings["ichimoku_medium"]}' in df.columns:
-            # Senkou A (ISA) diproyeksikan 26 periode ke depan.
-            # Jadi, nilai ISA untuk 'sekarang' ada di indeks df.index[-1-26]
-            # Pastikan indeks tidak out of bounds
-            if len(df) > 26:
-                current_senkou_a = df[f'ISA_{settings["ichimoku_fast"]}'].iloc[-1 - 26] # Ambil nilai 26 candle ke belakang
-                current_senkou_b = df[f'ISB_{settings["ichimoku_medium"]}'].iloc[-1 - 26] # Ambil nilai 26 candle ke belakang
-            else:
-                 logging.warning(f"[{tf}] Not enough data to calculate historical Senkou A/B for current candle. Expected {settings['ichimoku_slow']}+26, got {len(df)}.")
-        else:
-            logging.warning(f"[{tf}] Ichimoku Cloud columns (ISA/ISB) not found in DataFrame after calculation. They will be NaN.")
-
-        # --- PERBAIKAN UNTUK ICHIMOKU CLOUD SELESAI DI SINI ---
+        # Coba identifikasi nama kolom Senkou A dan B secara fleksibel
+        # Nama kolom umumnya ISA_9 dan ISB_26 atau serupa.
+        # Kita akan mencari kolom yang mengandung 'ISA' dan 'ISB'
         
-        last = df.iloc[-1] # Ambil data candle terakhir
+        isa_col = next((col for col in df.columns if 'ISA_' in col), None)
+        isb_col = next((col for col in df.columns if 'ISB_' in col), None)
+
+        if isa_col and isb_col:
+            # Senkou A (ISA) dan Senkou B (ISB) diproyeksikan 26 periode ke depan.
+            # Jadi, nilai untuk 'saat ini' ada di indeks 26 periode ke belakang.
+            if len(df) > 26: 
+                current_senkou_a = df[isa_col].iloc[-1 - 26] 
+                current_senkou_b = df[isb_col].iloc[-1 - 26] 
+            else:
+                 logging.warning(f"[{tf}] Not enough data ({len(df)} points) to retrieve historical Senkou A/B for current candle (needs > 26 periods).")
+        else:
+            logging.warning(f"[{tf}] Ichimoku Cloud columns (ISA/ISB) not found in DataFrame after calculation despite append=True. They will be NaN.")
+
+        # --- PERBAIKAN DAN DEBUGGING ICHIMOKU SELESAI DI SINI ---
+        
+        last = df.iloc[-1]
         
         price_action_info = ""
         if last['close'] > last['open']:
@@ -143,7 +147,6 @@ def analyze_tf(tf, settings):
             price_action_info = "Indecision in the market."
 
         trend = 'SIDEWAYS'
-        # Gunakan current_senkou_a/b untuk penentuan tren Ichimoku
         if pd.notna(current_senkou_a) and pd.notna(current_senkou_b):
             if last['close'] > current_senkou_a and last['close'] > current_senkou_b:
                 trend = 'BULLISH'
@@ -171,8 +174,8 @@ def analyze_tf(tf, settings):
             'stoch_k': last['stoch_k'],
             'stoch_d': last['stoch_d'],
             'stoch_trend': stoch_trend,
-            'senkou_a': current_senkou_a, # Gunakan nilai yang sudah diperbaiki
-            'senkou_b': current_senkou_b  # Gunakan nilai yang sudah diperbaiki
+            'senkou_a': current_senkou_a,
+            'senkou_b': current_senkou_b
         }
         
         console_message = f"\n=== [{tf.upper()}] BTC/USDT ===\n" \
@@ -206,7 +209,7 @@ def analyze_tf(tf, settings):
         return None, None
 
 def send_to_discord(message=None, embed=None):
-    """Mengirim pesan atau embed ke Discord webhook."""
+    """Sends a message or an embed to the configured Discord webhook."""
     if not DISCORD_WEBHOOK_URL: 
         logging.error("Discord Webhook URL not configured. Please set DISCORD_WEBHOOK_URL.")
         return
@@ -230,14 +233,14 @@ def send_to_discord(message=None, embed=None):
 
 def send_combined_analysis(all_analysis_data):
     """
-    Menggabungkan data analisis dari semua timeframe ke dalam satu embed Discord tunggal.
+    Combines analysis data from all timeframes into a single Discord embed.
     """
     if not all_analysis_data:
         logging.info("No analysis data available to send to Discord.")
         return
 
     embed_fields = []
-    main_color = 0x00FF00 # Hijau (Bullish)
+    main_color = 0x00FF00 # Default to green (Bullish)
 
     has_bearish = False
     has_sideways = False
@@ -248,13 +251,18 @@ def send_combined_analysis(all_analysis_data):
         elif tf_data['trend'] == 'SIDEWAYS':
             has_sideways = True
         
+        # Ensure senkou_a and senkou_b are formatted even if NaN
+        # Use a placeholder like 'N/A' if NaN, otherwise format as float.
+        senkou_a_val = f"`{tf_data['senkou_a']:.2f}`" if pd.notna(tf_data['senkou_a']) else "`N/A`"
+        senkou_b_val = f"`{tf_data['senkou_b']:.2f}`" if pd.notna(tf_data['senkou_b']) else "`N/A`"
+
         field_value = (
             f"**Harga:** `{tf_data['close_price']:.2f}` USDT\n"
             f"**Candle:** {tf_data['candle_type']} ({tf_data['price_action']})\n"
             f"**Trend (Ichimoku):** **{tf_data['trend']}**\n"
             f"**EMA:** {tf_data['ema_cross']}\n"
             f"**RSI:** `{tf_data['rsi']:.2f}` | **Stoch:** K:`{tf_data['stoch_k']:.2f}` D:`{tf_data['stoch_d']:.2f}` ({tf_data['stoch_trend']})\n"
-            f"**Ichimoku Cloud:** ISA:`{tf_data['senkou_a']:.2f}` | ISB:`{tf_data['senkou_b']:.2f}`"
+            f"**Ichimoku Cloud:** ISA:{senkou_a_val} | ISB:{senkou_b_val}"
         )
         embed_fields.append({
             "name": f"📊 {symbol} - {tf_data['tf']}",
@@ -263,11 +271,11 @@ def send_combined_analysis(all_analysis_data):
         })
     
     if has_bearish:
-        main_color = 0xFF0000 # Merah
+        main_color = 0xFF0000 # Red
     elif has_sideways:
-        main_color = 0xFFFF00 # Kuning
+        main_color = 0xFFFF00 # Yellow
     else:
-        main_color = 0x00FF00 # Hijau
+        main_color = 0x00FF00 # Green
 
     embed = {
         "title": f"📈 BTC/USDT - Combined Market Analysis",
