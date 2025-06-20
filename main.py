@@ -7,7 +7,7 @@ import time
 import logging
 
 # === Setup Logging ===
-logging.basicConfig(level=logging.INFO,
+logging.basicConfig(level=logging.INFO, # Kembali ke INFO setelah debugging selesai
                     format='%(asctime)s - %(levelname)s - %(message)s',
                     handlers=[
                         logging.FileHandler("crypto_analyzer.log"),
@@ -50,11 +50,6 @@ DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/1382392733062271117/kEfk
 
 # --- Fungsi Analisa ---
 def analyze_tf(tf, settings):
-    """
-    Melakukan analisis teknikal untuk satu timeframe.
-    Mengembalikan dictionary data analisis dan waktu candle terakhir,
-    bukan langsung mengirim ke Discord.
-    """
     logging.info(f"Starting analysis for {symbol} on {tf.upper()} timeframe.")
     try:
         ohlcv = exchange.fetch_ohlcv(symbol, tf, limit=settings['limit'])
@@ -65,11 +60,11 @@ def analyze_tf(tf, settings):
         df = pd.DataFrame(ohlcv, columns=['time', 'open', 'high', 'low', 'close', 'volume'])
         df['time'] = pd.to_datetime(df['time'], unit='ms')
 
-        required_data_points_for_ichimoku = settings['ichimoku_slow'] + 26 
-
+        # Ini tetap warning, karena Ichimoku Senkou Span A/B butuh shifting ke depan
+        # Jadi, kita butuh data lebih dari sekedar periode Ichimoku_slow.
+        required_data_points_for_ichimoku = settings['ichimoku_slow'] + settings['ichimoku_medium'] 
         if len(df) < required_data_points_for_ichimoku:
-            logging.warning(f"[{tf}] Not enough data ({len(df)} points) for full Ichimoku Cloud calculation (Senkou A/B will likely be NaN). Minimum needed (approx): {required_data_points_for_ichimoku}.")
-            # Lanjutkan eksekusi agar indikator lain tetap bisa dihitung
+            logging.warning(f"[{tf}] Not enough data ({len(df)} points) for full Ichimoku Cloud (Senkou A/B will likely be NaN). Minimum needed (approx): {required_data_points_for_ichimoku}.")
 
         df['ema1'] = ta.ema(df['close'], length=settings['ema1'])
         df['ema2'] = ta.ema(df['close'], length=settings['ema2'])
@@ -88,36 +83,26 @@ def analyze_tf(tf, settings):
             df['stoch_d'] = stoch.iloc[:, 1] if stoch.shape[1] > 1 else float('nan')
             logging.warning(f"[{tf}] Stochastic columns not found by specific names, using default first/second columns.")
 
-        # --- PERBAIKAN DAN DEBUGGING ICHIMOKU DIMULAI DI SINI ---
-        # Gunakan 'append=True' agar kolom Ichimoku ditambahkan langsung ke df
-        ta.ichimoku(df['high'], df['low'], df['close'], append=True) 
-        
-        # --- DEBUGGING: Cetak semua kolom DataFrame setelah Ichimoku dihitung ---
-        logging.debug(f"[{tf}] DataFrame columns after Ichimoku calculation: {df.columns.tolist()}")
-        # --- END DEBUGGING ---
+        # --- PERBAIKAN ICHIMOKU UNTUK pandas_ta 0.3.14b0 DIMULAI DI SINI ---
+        # ta.ichimoku() pada versi ini mengembalikan tuple dari Series, bukan menambah ke DataFrame.
+        # Format tuple: (tenkan, kijun, senkou_a, senkou_b, chikou)
+        ichi_tuple = ta.ichimoku(df['high'], df['low'], df['close'])
 
         current_senkou_a = float('nan')
         current_senkou_b = float('nan')
 
-        # Coba identifikasi nama kolom Senkou A dan B secara fleksibel
-        # Nama kolom umumnya ISA_9 dan ISB_26 atau serupa.
-        # Kita akan mencari kolom yang mengandung 'ISA' dan 'ISB'
-        
-        isa_col = next((col for col in df.columns if 'ISA_' in col), None)
-        isb_col = next((col for col in df.columns if 'ISB_' in col), None)
-
-        if isa_col and isb_col:
-            # Senkou A (ISA) dan Senkou B (ISB) diproyeksikan 26 periode ke depan.
-            # Jadi, nilai untuk 'saat ini' ada di indeks 26 periode ke belakang.
-            if len(df) > 26: 
-                current_senkou_a = df[isa_col].iloc[-1 - 26] 
-                current_senkou_b = df[isb_col].iloc[-1 - 26] 
+        if isinstance(ichi_tuple, tuple) and len(ichi_tuple) == 5:
+            # Senkou A (ichi_tuple[2]) dan Senkou B (ichi_tuple[3])
+            # Ini diproyeksikan 26 periode ke depan, jadi kita ambil nilai dari 26 candle ke belakang
+            if len(ichi_tuple[2]) > 26 and len(ichi_tuple[3]) > 26:
+                current_senkou_a = ichi_tuple[2].iloc[-1 - 26] # Ambil nilai 26 candle ke belakang
+                current_senkou_b = ichi_tuple[3].iloc[-1 - 26] # Ambil nilai 26 candle ke belakang
             else:
-                 logging.warning(f"[{tf}] Not enough data ({len(df)} points) to retrieve historical Senkou A/B for current candle (needs > 26 periods).")
+                logging.warning(f"[{tf}] Not enough historical data in Ichimoku tuple to get non-NaN Senkou A/B for the last candle.")
         else:
-            logging.warning(f"[{tf}] Ichimoku Cloud columns (ISA/ISB) not found in DataFrame after calculation despite append=True. They will be NaN.")
-
-        # --- PERBAIKAN DAN DEBUGGING ICHIMOKU SELESAI DI SINI ---
+            logging.warning(f"[{tf}] Unexpected output format from ta.ichimoku(). Ichimoku Spans will be NaN.")
+        
+        # --- PERBAIKAN ICHIMOKU SELESAI DI SINI ---
         
         last = df.iloc[-1]
         
@@ -209,7 +194,6 @@ def analyze_tf(tf, settings):
         return None, None
 
 def send_to_discord(message=None, embed=None):
-    """Sends a message or an embed to the configured Discord webhook."""
     if not DISCORD_WEBHOOK_URL: 
         logging.error("Discord Webhook URL not configured. Please set DISCORD_WEBHOOK_URL.")
         return
@@ -232,15 +216,12 @@ def send_to_discord(message=None, embed=None):
         logging.error(f"Failed to send message to Discord: {e}", exc_info=True)
 
 def send_combined_analysis(all_analysis_data):
-    """
-    Combines analysis data from all timeframes into a single Discord embed.
-    """
     if not all_analysis_data:
         logging.info("No analysis data available to send to Discord.")
         return
 
     embed_fields = []
-    main_color = 0x00FF00 # Default to green (Bullish)
+    main_color = 0x00FF00 
 
     has_bearish = False
     has_sideways = False
@@ -251,8 +232,6 @@ def send_combined_analysis(all_analysis_data):
         elif tf_data['trend'] == 'SIDEWAYS':
             has_sideways = True
         
-        # Ensure senkou_a and senkou_b are formatted even if NaN
-        # Use a placeholder like 'N/A' if NaN, otherwise format as float.
         senkou_a_val = f"`{tf_data['senkou_a']:.2f}`" if pd.notna(tf_data['senkou_a']) else "`N/A`"
         senkou_b_val = f"`{tf_data['senkou_b']:.2f}`" if pd.notna(tf_data['senkou_b']) else "`N/A`"
 
@@ -271,11 +250,11 @@ def send_combined_analysis(all_analysis_data):
         })
     
     if has_bearish:
-        main_color = 0xFF0000 # Red
+        main_color = 0xFF0000 
     elif has_sideways:
-        main_color = 0xFFFF00 # Yellow
+        main_color = 0xFFFF00 
     else:
-        main_color = 0x00FF00 # Green
+        main_color = 0x00FF00 
 
     embed = {
         "title": f"📈 BTC/USDT - Combined Market Analysis",
