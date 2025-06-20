@@ -7,7 +7,7 @@ import time
 import logging
 
 # === Setup Logging ===
-logging.basicConfig(level=logging.INFO, # Kembali ke INFO setelah debugging selesai
+logging.basicConfig(level=logging.INFO, # Kembali ke INFO
                     format='%(asctime)s - %(levelname)s - %(message)s',
                     handlers=[
                         logging.FileHandler("crypto_analyzer.log"),
@@ -23,21 +23,21 @@ exchange = ccxt.binance({
 symbol = 'BTC/USDT'
 timeframes = {
     '1h': {
-        'limit': 300, 
+        'limit': 500, # Tingkatkan lebih jauh
         'ema1': 10, 'ema2': 20,
         'rsi': 14,
         'stoch_k': 5, 'stoch_d': 3,
         'ichimoku_fast': 9, 'ichimoku_medium': 26, 'ichimoku_slow': 52
     },
     '4h': {
-        'limit': 500, 
+        'limit': 1000, # Tingkatkan lebih jauh
         'ema1': 21, 'ema2': 50,
         'rsi': 14,
         'stoch_k': 5, 'stoch_d': 3,
         'ichimoku_fast': 9, 'ichimoku_medium': 26, 'ichimoku_slow': 52
     },
     '1d': {
-        'limit': 700, 
+        'limit': 1500, # Tingkatkan lebih jauh
         'ema1': 50, 'ema2': 100,
         'rsi': 14,
         'stoch_k': 14, 'stoch_d': 3,
@@ -60,8 +60,11 @@ def analyze_tf(tf, settings):
         df = pd.DataFrame(ohlcv, columns=['time', 'open', 'high', 'low', 'close', 'volume'])
         df['time'] = pd.to_datetime(df['time'], unit='ms')
 
+        logging.info(f"[{tf}] Successfully fetched {len(df)} candles.") # LOG JUMLAH CANDLE YANG DIAMBIL
+
         # Ini tetap warning, karena Ichimoku Senkou Span A/B butuh shifting ke depan
         # Jadi, kita butuh data lebih dari sekedar periode Ichimoku_slow.
+        # Minimal 52 (ISB) + 26 (shift) = 78 candle untuk Senkou A/B terakhir tidak NaN
         required_data_points_for_ichimoku = settings['ichimoku_slow'] + settings['ichimoku_medium'] 
         if len(df) < required_data_points_for_ichimoku:
             logging.warning(f"[{tf}] Not enough data ({len(df)} points) for full Ichimoku Cloud (Senkou A/B will likely be NaN). Minimum needed (approx): {required_data_points_for_ichimoku}.")
@@ -94,11 +97,12 @@ def analyze_tf(tf, settings):
         if isinstance(ichi_tuple, tuple) and len(ichi_tuple) == 5:
             # Senkou A (ichi_tuple[2]) dan Senkou B (ichi_tuple[3])
             # Ini diproyeksikan 26 periode ke depan, jadi kita ambil nilai dari 26 candle ke belakang
+            # Pastikan ada cukup data untuk melihat ke belakang 26 periode di Series
             if len(ichi_tuple[2]) > 26 and len(ichi_tuple[3]) > 26:
                 current_senkou_a = ichi_tuple[2].iloc[-1 - 26] # Ambil nilai 26 candle ke belakang
                 current_senkou_b = ichi_tuple[3].iloc[-1 - 26] # Ambil nilai 26 candle ke belakang
             else:
-                logging.warning(f"[{tf}] Not enough historical data in Ichimoku tuple to get non-NaN Senkou A/B for the last candle.")
+                logging.warning(f"[{tf}] Not enough historical data in Ichimoku tuple (len={len(ichi_tuple[2])}) to get non-NaN Senkou A/B for the last candle (needs > 26 periods).")
         else:
             logging.warning(f"[{tf}] Unexpected output format from ta.ichimoku(). Ichimoku Spans will be NaN.")
         
@@ -269,70 +273,3 @@ def send_combined_analysis(all_analysis_data):
 
 # --- Main Execution Loop ---
 if __name__ == "__main__":
-    logging.info("Starting crypto analysis bot for 1h, 4h, 1d. Combined updates sent to Discord when new candles close.")
-
-    last_processed_candle_time = {tf: None for tf in timeframes.keys()}
-    
-    logging.info("\n--- Performing initial combined analysis for all timeframes ---")
-    initial_analysis_results = []
-    for tf, settings in timeframes.items():
-        analysis_data, processed_time = analyze_tf(tf, settings)
-        if analysis_data:
-            initial_analysis_results.append(analysis_data)
-            last_processed_candle_time[tf] = processed_time
-        time.sleep(exchange.rateLimit / 1000 + 1)
-    
-    if initial_analysis_results:
-        send_combined_analysis(initial_analysis_results)
-    else:
-        logging.warning("No initial analysis data to send for combined message.")
-
-    logging.info("\nInitial analyses complete. Entering continuous monitoring mode.")
-
-    while True:
-        current_time = datetime.now()
-        
-        minutes_to_next_15 = 15 - (current_time.minute % 15)
-        if minutes_to_next_15 == 15 and current_time.second == 0:
-            minutes_to_next_15 = 0
-
-        next_15m_mark = current_time + timedelta(minutes=minutes_to_next_15)
-        next_15m_mark = next_15m_mark.replace(second=0, microsecond=0)
-
-        sleep_duration = (next_15m_mark - current_time).total_seconds()
-        sleep_duration += 5 
-
-        logging.info(f"\n[{current_time.strftime('%Y-%m-%d %H:%M:%S WIB')}] Waiting for {int(sleep_duration)} seconds until {next_15m_mark.strftime('%H:%M:%S WIB')}...")
-        time.sleep(sleep_duration)
-
-        logging.info(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S WIB')}] Checking for new candle closes...")
-
-        updated_timeframes_data = []
-        
-        for tf, settings in timeframes.items():
-            try:
-                latest_ohlcv = exchange.fetch_ohlcv(symbol, tf, limit=1)
-                
-                if latest_ohlcv:
-                    latest_candle_time_ms = latest_ohlcv[0][0]
-                    latest_candle_time = pd.to_datetime(latest_candle_time_ms, unit='ms')
-
-                    if last_processed_candle_time[tf] is None or latest_candle_time > last_processed_candle_time[tf]:
-                        logging.info(f"New {tf.upper()} candle detected! Analyzing...")
-                        analysis_data, processed_time = analyze_tf(tf, settings)
-                        if analysis_data:
-                            updated_timeframes_data.append(analysis_data)
-                            last_processed_candle_time[tf] = processed_time
-                    else:
-                        logging.info(f"No new {tf.upper()} candle since last check. Last processed: {last_processed_candle_time[tf].strftime('%Y-%m-%d %H:%M:%S')}")
-                else:
-                    logging.warning(f"Could not fetch latest {tf.upper()} candle to check for updates.")
-            except Exception as e:
-                logging.error(f"Error checking {tf.upper()} candle update: {e}", exc_info=True)
-            
-            time.sleep(exchange.rateLimit / 1000 + 1)
-        
-        if updated_timeframes_data:
-            send_combined_analysis(updated_timeframes_data)
-        else:
-            logging.info("No new candles closed across all timeframes. Skipping Discord update.")
