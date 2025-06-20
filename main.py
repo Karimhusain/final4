@@ -4,15 +4,14 @@ import pandas_ta as ta
 from datetime import datetime, timedelta
 import requests
 import time
-import logging # Import logging module
+import logging
 
 # === Setup Logging ===
-# Konfigurasi logging agar pesan error atau informasi penting tercatat
 logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s - %(levelname)s - %(message)s',
                     handlers=[
-                        logging.FileHandler("crypto_analyzer.log"), # Simpan log ke file
-                        logging.StreamHandler() # Tampilkan juga di konsol
+                        logging.FileHandler("crypto_analyzer.log"),
+                        logging.StreamHandler()
                     ])
 
 # === Setup Exchange ===
@@ -47,7 +46,6 @@ timeframes = {
 }
 
 # === Discord Webhook URL ===
-# GANTI INI DENGAN URL WEBHOOK DISCORD ASLI ANDA
 DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/1382392733062271117/kEfkDCCJzkSVNZdfgTHELp17pThnpZEYL-2lJ9QFFiX_T3FnBBhbSlCMThmkqXjR-FYq"
 
 # --- Fungsi Analisa ---
@@ -62,20 +60,16 @@ def analyze_tf(tf, settings):
         df = pd.DataFrame(ohlcv, columns=['time', 'open', 'high', 'low', 'close', 'volume'])
         df['time'] = pd.to_datetime(df['time'], unit='ms')
 
-        # Ensure df has enough data for indicators
         required_data_points = max(settings['ema2'], settings['rsi'], settings['stoch_k'], settings['ichimoku_slow'])
         if len(df) < required_data_points:
              logging.warning(f"[{tf}] Not enough data ({len(df)} points) for full indicator calculation. Minimum needed: {required_data_points}. Skipping analysis.")
              return None
 
-        # EMA
         df['ema1'] = ta.ema(df['close'], length=settings['ema1'])
         df['ema2'] = ta.ema(df['close'], length=settings['ema2'])
 
-        # RSI
         df['rsi'] = ta.rsi(df['close'], length=settings['rsi'])
 
-        # Stochastic
         stoch = ta.stoch(df['high'], df['low'], df['close'], k=settings['stoch_k'], d=settings['stoch_d'])
         stoch_k_col = f'STOCHk_{settings["stoch_k"]}_{settings["stoch_d"]}_{settings["stoch_d"]}'
         stoch_d_col = f'STOCHd_{settings["stoch_k"]}_{settings["stoch_d"]}_{settings["stoch_d"]}'
@@ -88,22 +82,54 @@ def analyze_tf(tf, settings):
             df['stoch_d'] = stoch.iloc[:, 1] if stoch.shape[1] > 1 else float('nan')
             logging.warning(f"[{tf}] Stochastic columns not found by specific names, using default first/second columns.")
 
-
-        # Ichimoku Kumo
+        # --- PERBAIKAN UNTUK ICHIMOKU CLOUD DIMULAI DI SINI ---
         ichi = ta.ichimoku(df['high'], df['low'], df['close'])
-        df['senkou_a'] = ichi['ISA_9']
-        df['senkou_b'] = ichi['ISB_26']
 
+        ichi_df = None
+        if isinstance(ichi, tuple):
+            # If it's a tuple of Series, concatenate them into a DataFrame
+            ichi_df = pd.concat(ichi, axis=1)
+        elif isinstance(ichi, pd.DataFrame):
+            ichi_df = ichi # Already a DataFrame
+        else:
+            logging.critical(f"[{tf}] Unexpected type for Ichimoku output: {type(ichi)}. Cannot parse. Setting Ichimoku to NaN.")
+            df['senkou_a'] = float('nan')
+            df['senkou_b'] = float('nan')
+            last = df.iloc[-1] # Ensure 'last' is defined even if Ichimoku fails
+            send_to_discord(message=f"Error Ichimoku {tf.upper()}: Unexpected output type. Check logs.")
+            return None # Skip further analysis for this TF
+
+        # Try to find the columns by their expected names or common patterns
+        senkou_a_col = next((col for col in ichi_df.columns if 'ISA' in col and '9' in col), None) # Check for ISA and 9 (fast period)
+        senkou_b_col = next((col for col in ichi_df.columns if 'ISB' in col and '26' in col), None) # Check for ISB and 26 (medium period)
+
+        if senkou_a_col and senkou_b_col:
+            df['senkou_a'] = ichi_df[senkou_a_col]
+            df['senkou_b'] = ichi_df[senkou_b_col]
+        else:
+            logging.error(f"[{tf}] Could not find Senkou Span A or B columns in Ichimoku output by name. Available columns: {ichi_df.columns.tolist()}")
+            # Fallback to numerical indexing if names not found (less reliable but might work)
+            if ichi_df.shape[1] >= 2: # Ensure there are at least two columns for A and B
+                # The last two columns are typically Senkou A and Senkou B, but order might vary
+                # It's better to explicitly check names or rely on consistent indexing if names are not present
+                # As a last resort, assume standard order: ISA is typically before ISB in the tuple/DataFrame
+                df['senkou_a'] = ichi_df.iloc[:, -2] if ichi_df.shape[1] > 1 else float('nan')
+                df['senkou_b'] = ichi_df.iloc[:, -1] if ichi_df.shape[1] > 0 else float('nan') # This assumes Senkou B is the very last series
+                logging.warning(f"[{tf}] Using numerical indexing for Senkou Spans as names not found. Please verify correctness by checking pandas_ta Ichimoku output structure.")
+            else:
+                df['senkou_a'] = float('nan')
+                df['senkou_b'] = float('nan')
+                logging.warning(f"[{tf}] Not enough columns in Ichimoku output for Senkou Spans. Setting to NaN.")
+        # --- PERBAIKAN UNTUK ICHIMOKU CLOUD SELESAI DI SINI ---
+        
         # Ambil data terakhir
         last = df.iloc[-1]
         
         # --- Price Action Analysis ---
         price_action_info = ""
-        # Check if the candle is bullish or bearish
         if last['close'] > last['open']:
             candle_type = "Bullish Candle 🟢"
-            # How close is the close price to the high?
-            if last['high'] - last['low'] > 0: # Avoid division by zero
+            if last['high'] - last['low'] > 0:
                 close_to_high_ratio = (last['close'] - last['low']) / (last['high'] - last['low'])
                 if close_to_high_ratio >= 0.8:
                     price_action_info = "Strong bullish momentum (closing near high)."
@@ -113,7 +139,7 @@ def analyze_tf(tf, settings):
                     price_action_info = "Bullish candle."
         elif last['close'] < last['open']:
             candle_type = "Bearish Candle 🔴"
-            if last['high'] - last['low'] > 0: # Avoid division by zero
+            if last['high'] - last['low'] > 0:
                 close_to_low_ratio = (last['close'] - last['low']) / (last['high'] - last['low'])
                 if close_to_low_ratio <= 0.2:
                     price_action_info = "Strong bearish momentum (closing near low)."
@@ -143,11 +169,10 @@ def analyze_tf(tf, settings):
             if last['stoch_k'] > last['stoch_d']:
                 stoch_trend = 'Bullish Cross'
 
-        # --- Prepare Discord Embed Message ---
         embed = {
             "title": f"📈 BTC/USDT - {tf.upper()} Analysis",
             "description": f"Update waktu: {datetime.now().strftime('%Y-%m-%d %H:%M:%S WIB')}",
-            "color": 65280 if trend == "BULLISH" else (16711680 if trend == "BEARISH" else 16776960), # Green, Red, Yellow
+            "color": 65280 if trend == "BULLISH" else (16711680 if trend == "BEARISH" else 16776960),
             "fields": [
                 {"name": "Harga Terakhir", "value": f"`{last['close']:.2f}` USDT", "inline": True},
                 {"name": "Jenis Candle", "value": f"{candle_type}", "inline": True},
@@ -161,10 +186,8 @@ def analyze_tf(tf, settings):
             "footer": {"text": "Data dari Binance via CCXT & pandas_ta"}
         }
 
-        # Send to Discord using embed
         send_to_discord(embed=embed)
 
-        # Print to console for quick checks (can be more condensed here)
         console_message = f"\n=== [{tf.upper()}] BTC/USDT ===\n" \
                           f"Waktu: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n" \
                           f"Price: {last['close']:.2f} ({candle_type}, {price_action_info})\n" \
@@ -173,18 +196,17 @@ def analyze_tf(tf, settings):
                           f"RSI: {last['rsi']:.2f}\n" \
                           f"Stochastic K: {last['stoch_k']:.2f}, D: {last['stoch_d']:.2f} ({stoch_trend})\n" \
                           f"===============================\n"
-        logging.info(console_message) # Use logging.info for console output
+        logging.info(console_message)
 
-        return last['time'] # Return the timestamp of the last candle fetched
-
+        return last['time']
+        
     except ccxt.NetworkError as e:
         logging.error(f"[{tf}] Network error: {e}. Retrying soon...")
         return None
     except ccxt.ExchangeError as e:
-        # Handle specific exchange errors like rate limits
         if 'Too many requests' in str(e) or 'limit' in str(e).lower():
             logging.warning(f"[{tf}] Rate limit hit: {e}. Waiting longer before next attempt.")
-            time.sleep(exchange.rateLimit / 1000 + 5) # Wait rateLimit duration + 5 seconds buffer
+            time.sleep(exchange.rateLimit / 1000 + 5)
         else:
             logging.error(f"[{tf}] Exchange error: {e}. Check symbol or API limits.")
         return None
@@ -196,7 +218,6 @@ def analyze_tf(tf, settings):
         return None
 
 def send_to_discord(message=None, embed=None):
-    """Sends a message or an embed to the configured Discord webhook."""
     if not DISCORD_WEBHOOK_URL or DISCORD_WEBHOOK_URL == "YOUR_DISCORD_WEBHOOK_URL_HERE":
         logging.error("Discord Webhook URL not configured. Please set DISCORD_WEBHOOK_URL.")
         return
@@ -207,7 +228,7 @@ def send_to_discord(message=None, embed=None):
     if embed:
         payload["embeds"] = [embed]
 
-    if not payload: # If no message or embed is provided
+    if not payload:
         logging.warning("No content or embed provided for Discord message. Skipping.")
         return
 
@@ -218,28 +239,24 @@ def send_to_discord(message=None, embed=None):
     except requests.exceptions.RequestException as e:
         logging.error(f"Failed to send message to Discord: {e}", exc_info=True)
 
-
 # --- Main Execution Loop ---
 if __name__ == "__main__":
     logging.info("Starting crypto analysis bot for 1h, 4h, 1d. Updates sent to Discord every 15 minutes if new candle closes.")
 
-    # Dictionary to store the last candle timestamp for each timeframe
     last_processed_candle_time = {tf: None for tf in timeframes.keys()}
     
-    # Run all analyses once at startup to populate initial data
     logging.info("\n--- Performing initial analysis for all timeframes ---")
     for tf, settings in timeframes.items():
         processed_time = analyze_tf(tf, settings)
         if processed_time:
             last_processed_candle_time[tf] = processed_time
-        time.sleep(exchange.rateLimit / 1000 + 1) # Respect initial rate limits
+        time.sleep(exchange.rateLimit / 1000 + 1)
 
     logging.info("\nInitial analyses complete. Entering continuous monitoring mode.")
 
     while True:
         current_time = datetime.now()
         
-        # Calculate time to next 15-minute mark
         minutes_to_next_15 = 15 - (current_time.minute % 15)
         if minutes_to_next_15 == 15 and current_time.second == 0:
             minutes_to_next_15 = 0
@@ -248,27 +265,24 @@ if __name__ == "__main__":
         next_15m_mark = next_15m_mark.replace(second=0, microsecond=0)
 
         sleep_duration = (next_15m_mark - current_time).total_seconds()
-        sleep_duration += 5 # Add a 5-second buffer to ensure candle close
+        sleep_duration += 5
 
         logging.info(f"\n[{current_time.strftime('%Y-%m-%d %H:%M:%S WIB')}] Waiting for next 15m interval. Sleeping for {int(sleep_duration)} seconds until {next_15m_mark.strftime('%H:%M:%S WIB')}...")
         time.sleep(sleep_duration)
 
-        # After waking up, check which timeframes need updating
         logging.info(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S WIB')}] Checking for new candle closes...")
 
         for tf, settings in timeframes.items():
             try:
-                # Fetch only the latest candle to check its timestamp
                 latest_ohlcv = exchange.fetch_ohlcv(symbol, tf, limit=1)
                 
                 if latest_ohlcv:
                     latest_candle_time_ms = latest_ohlcv[0][0]
                     latest_candle_time = pd.to_datetime(latest_candle_time_ms, unit='ms')
 
-                    # Compare with last processed time, handling initial None state
                     if last_processed_candle_time[tf] is None or latest_candle_time > last_processed_candle_time[tf]:
                         logging.info(f"New {tf.upper()} candle detected! Analyzing and sending to Discord.")
-                        processed_time = analyze_tf(tf, settings) # Call analyze_tf to process and send
+                        processed_time = analyze_tf(tf, settings)
                         if processed_time:
                             last_processed_candle_time[tf] = processed_time
                     else:
@@ -278,5 +292,5 @@ if __name__ == "__main__":
             except Exception as e:
                 logging.error(f"Error checking {tf.upper()} candle update: {e}", exc_info=True)
             
-            time.sleep(exchange.rateLimit / 1000 + 1) # Respect exchange rate limits between fetches
+            time.sleep(exchange.rateLimit / 1000 + 1)
 
